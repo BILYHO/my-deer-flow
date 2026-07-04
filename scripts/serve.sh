@@ -428,9 +428,9 @@ run_service() {
     local name="$1" cmd="$2" port="$3" timeout="$4"
 
     if _is_port_listening "$port"; then
-        echo "✗ $name cannot start because port $port is already in use."
-        echo "  If it belongs to this worktree, run 'make stop'; otherwise free the port manually."
-        cleanup 1
+        echo "⚠ Port $port is already in use, freeing it..."
+        _kill_repo_port "$port"
+        sleep 1
     fi
 
     echo "Starting $name..."
