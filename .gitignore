@@ -66,3 +66,4 @@ config.yaml.bak
 /frontend/playwright-report/
 .gstack/
 .worktrees
+.history
