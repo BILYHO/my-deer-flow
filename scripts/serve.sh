@@ -48,6 +48,18 @@ _pick_python() {
     return 1
 }
 
+_pick_pnpm() {
+    # Prefer a direct pnpm binary; fall back to corepack pnpm (same strategy as
+    # check.py), since corepack may be on PATH in non-interactive shells while
+    # the pnpm shim is not.
+    if command -v pnpm >/dev/null 2>&1; then
+        printf 'pnpm\n'
+    elif command -v corepack >/dev/null 2>&1; then
+        printf 'corepack pnpm\n'
+    fi
+    return 0
+}
+
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
 DEV_MODE=true
@@ -293,15 +305,18 @@ if $DAEMON_MODE; then
     MODE_LABEL="$MODE_LABEL [daemon]"
 fi
 
+# Resolve pnpm command before frontend/cmd usage (fallback to corepack)
+PNPM_CMD=$(_pick_pnpm)
+
 # Frontend command
 if $DEV_MODE; then
-    FRONTEND_CMD="pnpm run dev"
+    FRONTEND_CMD="$PNPM_CMD run dev"
 else
     if ! PYTHON_BIN="$(_pick_python)"; then
         echo "Python is required to generate BETTER_AUTH_SECRET."
         exit 1
     fi
-    FRONTEND_CMD="env BETTER_AUTH_SECRET=$($PYTHON_BIN -c 'import secrets; print(secrets.token_hex(16))') pnpm run preview"
+    FRONTEND_CMD="env BETTER_AUTH_SECRET=$($PYTHON_BIN -c 'import secrets; print(secrets.token_hex(16))') $PNPM_CMD run preview"
 fi
 
 # Runtime path defaults. Local `make dev` launches Gateway from `backend/`,
@@ -386,7 +401,7 @@ if ! $SKIP_INSTALL; then
     # in particular). Required for postgres extras — see PR #2584.
     # Intentionally unquoted to splat multiple `--extra X` pairs.
     (cd backend && uv sync --quiet --all-packages $UV_EXTRAS_FLAGS) || { echo "✗ Backend dependency install failed"; exit 1; }
-    (cd frontend && pnpm install --silent) || { echo "✗ Frontend dependency install failed"; exit 1; }
+    (cd frontend && $PNPM_CMD install --silent) || { echo "✗ Frontend dependency install failed"; exit 1; }
     echo "✓ Dependencies synced"
 else
     echo "⏩ Skipping dependency install (--skip-install)"
