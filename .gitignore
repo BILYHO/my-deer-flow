@@ -67,3 +67,6 @@ config.yaml.bak
 .gstack/
 .worktrees
 .history
+
+# 知识库（独立 git 仓库，不纳入主项目版本控制）
+知识库/
