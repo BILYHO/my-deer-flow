@@ -93,12 +93,12 @@ export function getMessageGroups(messages: Message[]): MessageGroup[] {
             lastGroup.messages.push(message);
           } else {
             // groups is empty (shouldn't happen — the outer for loop is guarded
-            // by `messages.length === 0 -> return []`), but keep the diagnostic
-            // just in case.
-            console.error(
-              "Unexpected tool message with no preceding group",
-              message,
-            );
+            // Create a processing group to hold it instead of dropping silently.
+            groups.push({
+              id: message.id,
+              type: "assistant:processing",
+              messages: [message],
+            });
           }
         }
       }
