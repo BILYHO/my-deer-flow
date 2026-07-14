@@ -3,11 +3,13 @@
 import logging
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from deerflow.config.memory_config import get_memory_config
+from deerflow.trace_context import request_trace_context
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,7 @@ class ConversationContext:
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     agent_name: str | None = None
     user_id: str | None = None
+    deerflow_trace_id: str | None = None
     correction_detected: bool = False
     reinforcement_detected: bool = False
 
@@ -39,6 +42,7 @@ class MemoryUpdateQueue:
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
         self._processing = False
+        self._reprocess_pending = False
 
     @staticmethod
     def _queue_key(
@@ -55,6 +59,7 @@ class MemoryUpdateQueue:
         messages: list[Any],
         agent_name: str | None = None,
         user_id: str | None = None,
+        deerflow_trace_id: str | None = None,
         correction_detected: bool = False,
         reinforcement_detected: bool = False,
     ) -> None:
@@ -67,6 +72,8 @@ class MemoryUpdateQueue:
             user_id: The user ID captured at enqueue time. Stored in ConversationContext so it
                 survives the threading.Timer boundary (ContextVar does not propagate across
                 raw threads).
+            deerflow_trace_id: Request trace id captured at enqueue time so the
+                later Timer thread can attach it to memory LLM tracing metadata.
             correction_detected: Whether recent turns include an explicit correction signal.
             reinforcement_detected: Whether recent turns include a positive reinforcement signal.
         """
@@ -80,6 +87,7 @@ class MemoryUpdateQueue:
                 messages=messages,
                 agent_name=agent_name,
                 user_id=user_id,
+                deerflow_trace_id=deerflow_trace_id,
                 correction_detected=correction_detected,
                 reinforcement_detected=reinforcement_detected,
             )
@@ -93,6 +101,7 @@ class MemoryUpdateQueue:
         messages: list[Any],
         agent_name: str | None = None,
         user_id: str | None = None,
+        deerflow_trace_id: str | None = None,
         correction_detected: bool = False,
         reinforcement_detected: bool = False,
     ) -> None:
@@ -107,6 +116,7 @@ class MemoryUpdateQueue:
                 messages=messages,
                 agent_name=agent_name,
                 user_id=user_id,
+                deerflow_trace_id=deerflow_trace_id,
                 correction_detected=correction_detected,
                 reinforcement_detected=reinforcement_detected,
             )
@@ -121,6 +131,7 @@ class MemoryUpdateQueue:
         messages: list[Any],
         agent_name: str | None,
         user_id: str | None,
+        deerflow_trace_id: str | None,
         correction_detected: bool,
         reinforcement_detected: bool,
     ) -> None:
@@ -136,6 +147,7 @@ class MemoryUpdateQueue:
             messages=messages,
             agent_name=agent_name,
             user_id=user_id,
+            deerflow_trace_id=deerflow_trace_id,
             correction_detected=merged_correction_detected,
             reinforcement_detected=merged_reinforcement_detected,
         )
@@ -170,8 +182,12 @@ class MemoryUpdateQueue:
 
         with self._lock:
             if self._processing:
-                # Preserve immediate flush semantics even if another worker is active.
-                self._schedule_timer(0)
+                # Another worker is already draining the queue. Instead of
+                # spawning a tight timer spin (repeatedly re-scheduling a
+                # 0-delay Timer thread while busy), defer a single re-run: the
+                # active worker checks this flag in its finally block and
+                # reschedules once if work remains.
+                self._reprocess_pending = True
                 return
 
             if not self._queue:
@@ -188,30 +204,43 @@ class MemoryUpdateQueue:
             updater = MemoryUpdater()
 
             for context in contexts_to_process:
-                try:
-                    logger.info("Updating memory for thread %s", context.thread_id)
-                    success = updater.update_memory(
-                        messages=context.messages,
-                        thread_id=context.thread_id,
-                        agent_name=context.agent_name,
-                        correction_detected=context.correction_detected,
-                        reinforcement_detected=context.reinforcement_detected,
-                        user_id=context.user_id,
-                    )
-                    if success:
-                        logger.info("Memory updated successfully for thread %s", context.thread_id)
-                    else:
-                        logger.warning("Memory update skipped/failed for thread %s", context.thread_id)
-                except Exception as e:
-                    logger.error("Error updating memory for thread %s: %s", context.thread_id, e)
+                # Rebind the request-trace ContextVar from the value captured at
+                # enqueue time so ``TraceContextFilter`` attaches the correct
+                # trace id to every log record emitted below (this Timer thread
+                # does not inherit the enqueue-thread's ContextVar). Each
+                # iteration is scoped independently so id A does not leak into
+                # id B's logs.
+                trace_ctx = request_trace_context(context.deerflow_trace_id) if context.deerflow_trace_id else nullcontext()
+                with trace_ctx:
+                    try:
+                        logger.info("Updating memory for thread %s", context.thread_id)
+                        success = updater.update_memory(
+                            messages=context.messages,
+                            thread_id=context.thread_id,
+                            agent_name=context.agent_name,
+                            correction_detected=context.correction_detected,
+                            reinforcement_detected=context.reinforcement_detected,
+                            user_id=context.user_id,
+                            deerflow_trace_id=context.deerflow_trace_id,
+                        )
+                        if success:
+                            logger.info("Memory updated successfully for thread %s", context.thread_id)
+                        else:
+                            logger.warning("Memory update skipped/failed for thread %s", context.thread_id)
+                    except Exception as e:
+                        logger.error("Error updating memory for thread %s: %s", context.thread_id, e)
 
-                # Small delay between updates to avoid rate limiting
-                if len(contexts_to_process) > 1:
-                    time.sleep(0.5)
+                    # Small delay between updates to avoid rate limiting
+                    if len(contexts_to_process) > 1:
+                        time.sleep(0.5)
 
         finally:
             with self._lock:
                 self._processing = False
+                if self._reprocess_pending:
+                    self._reprocess_pending = False
+                    if self._queue:
+                        self._schedule_timer(0)
 
     def flush(self) -> None:
         """Force immediate processing of the queue.
@@ -243,6 +272,7 @@ class MemoryUpdateQueue:
                 self._timer = None
             self._queue.clear()
             self._processing = False
+            self._reprocess_pending = False
 
     @property
     def pending_count(self) -> int:

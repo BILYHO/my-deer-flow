@@ -13,8 +13,10 @@ from pathlib import Path
 from typing import NamedTuple
 
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX
+from deerflow.sandbox.env_policy import build_sandbox_env
 from deerflow.sandbox.local.list_dir import list_dir
-from deerflow.sandbox.sandbox import Sandbox
+from deerflow.sandbox.path_patterns import build_output_mask_pattern
+from deerflow.sandbox.sandbox import Sandbox, _validate_extra_env
 from deerflow.sandbox.search import GrepMatch, find_glob_matches, find_grep_matches
 
 logger = logging.getLogger(__name__)
@@ -219,7 +221,22 @@ class LocalSandbox(Sandbox):
     @cached_property
     def _reverse_output_patterns(self) -> list[re.Pattern[str]]:
         """Compiled matchers for local paths in command output (longest local path first)."""
-        return [re.compile(re.escape(self._resolved_local_paths[m]) + r"(?:[/\\][^\s\"';&|<>()]*)?") for m in self._mappings_by_local_specificity]
+        # The rule — segment boundary plus path tail — is owned by
+        # ``deerflow.sandbox.path_patterns`` and shared with
+        # ``sandbox.tools._compiled_mask_patterns``, the other site that rewrites host
+        # paths back to virtual ones. Its rationale (why the boundary class is
+        # text-oriented rather than shell-oriented like ``_command_pattern``, why ``$``
+        # is load-bearing) lives with the owner rather than in a second copy here, which
+        # is what let the two drift before (#4035 added the boundary here and missed
+        # that site; #4053 added it there).
+        #
+        # What is specific to this site: without the boundary the regex yields the bare
+        # root, which then *equals* the mount root and so satisfies
+        # ``_reverse_resolve_path``'s own ``+ "/"`` guard — the sibling is rewritten to a
+        # container path that forward resolution refuses to map back. And bases stay
+        # separator-*sensitive*: they come from ``Path.resolve()`` and already carry the
+        # platform's separator, so relaxing them would widen what this masks.
+        return [build_output_mask_pattern(self._resolved_local_paths[m]) for m in self._mappings_by_local_specificity]
 
     @cached_property
     def _resolved_local_paths(self) -> dict[PathMapping, str]:
@@ -327,9 +344,20 @@ class LocalSandbox(Sandbox):
         # Try each mapping (longest local path first for more specific matches)
         for mapping in self._mappings_by_local_specificity:
             local_path_resolved = self._resolved_local_paths[mapping]
-            if path_str == local_path_resolved or path_str.startswith(local_path_resolved + "/"):
-                # Replace the local path prefix with container path
-                relative = path_str[len(local_path_resolved) :].lstrip("/")
+            # ``Path.resolve()`` always renders with the native separator
+            # (backslash on Windows), regardless of the forward-slash
+            # normalization above, so the containment check must compare with
+            # ``os.sep`` here too -- mirroring ``_is_read_only_path`` -- instead
+            # of a hardcoded "/". A hardcoded "/" can never match a
+            # backslash-joined nested path on Windows, so every nested path
+            # silently fell through to the "no mapping found" branch below and
+            # leaked the raw host path (real username, full directory tree).
+            if path_str == local_path_resolved or path_str.startswith(local_path_resolved + os.sep):
+                # Replace the local path prefix with container path. Container
+                # paths are always POSIX-style, so the extracted relative
+                # portion (native-separated on Windows) is normalized to
+                # forward slashes before being spliced in.
+                relative = path_str[len(local_path_resolved) :].lstrip(os.sep).replace(os.sep, "/")
                 resolved = f"{mapping.container_path}/{relative}" if relative else mapping.container_path
                 return resolved
 
@@ -375,7 +403,9 @@ class LocalSandbox(Sandbox):
 
         def replace_match(match: re.Match) -> str:
             matched_path = match.group(0)
-            return self._resolve_path(matched_path)
+            # Normalize to forward slashes so bash doesn't interpret Windows
+            # backslash sequences (\\U, \\a, \\d, \\s, \\n, \\t) as escapes.
+            return self._resolve_path(matched_path).replace("\\", "/")
 
         return pattern.sub(replace_match, command)
 
@@ -433,16 +463,32 @@ class LocalSandbox(Sandbox):
 
         raise RuntimeError("No suitable shell executable found. Tried /bin/zsh, /bin/bash, /bin/sh, and `sh` on PATH.")
 
-    def execute_command(self, command: str, timeout: float | None = None) -> str:
+    def execute_command(
+        self,
+        command: str,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        # Validate ``env`` keys against the POSIX env-var rule. Defense in
+        # depth: ``subprocess.run(env=...)`` does not go through a shell so a
+        # metachar in a key here would not actually inject — but the public
+        # ``Sandbox.execute_command`` contract is shared with the AIO sandbox,
+        # which DOES splice keys into ``export <k>=<v>``. Enforcing the same
+        # rule on both implementations keeps the contract consistent and forces
+        # any new caller to use safe key names.
+        _validate_extra_env(env)
         # Resolve container paths in command before execution
         resolved_command = self._resolve_paths_in_command(command)
         shell = self._get_shell()
         if timeout is None:
             timeout = DEFAULT_COMMAND_TIMEOUT_SECONDS
 
+        # Inherit os.environ minus platform secrets, then layer any injected
+        # request-scoped secrets on top (#3861). An explicit env is always passed
+        # so platform credentials never leak into skill subprocesses.
+        sandbox_env = build_sandbox_env(env)
         timed_out = False
         if os.name == "nt":
-            env = None
             if self._is_powershell(shell):
                 args = [shell, "-NoProfile", "-Command", resolved_command]
             elif self._is_cmd_shell(shell):
@@ -450,8 +496,8 @@ class LocalSandbox(Sandbox):
             else:
                 args = [shell, "-c", resolved_command]
                 if self._is_msys_shell(shell):
-                    env = {
-                        **os.environ,
+                    sandbox_env = {
+                        **sandbox_env,
                         "MSYS_NO_PATHCONV": "1",
                         "MSYS2_ARG_CONV_EXCL": "*",
                     }
@@ -463,7 +509,7 @@ class LocalSandbox(Sandbox):
                     capture_output=True,
                     text=True,
                     timeout=timeout,
-                    env=env,
+                    env=sandbox_env,
                 )
                 stdout, stderr, returncode = result.stdout, result.stderr, result.returncode
             except subprocess.TimeoutExpired as exc:
@@ -473,7 +519,7 @@ class LocalSandbox(Sandbox):
                 returncode = 0
         else:
             args = [shell, "-c", resolved_command]
-            stdout, stderr, returncode, timed_out = self._run_posix_command(args, timeout)
+            stdout, stderr, returncode, timed_out = self._run_posix_command(args, timeout, sandbox_env)
 
         output = stdout
         if stderr:
@@ -489,7 +535,11 @@ class LocalSandbox(Sandbox):
         return self._reverse_resolve_paths_in_output(final_output)
 
     @staticmethod
-    def _run_posix_command(args: list[str], timeout: float) -> tuple[str, str, int, bool]:
+    def _run_posix_command(
+        args: list[str],
+        timeout: float,
+        env: dict[str, str] | None = None,
+    ) -> tuple[str, str, int, bool]:
         """Run a command on POSIX with bounded pipe capture.
 
         ``subprocess.communicate()`` cannot be used here: a backgrounded
@@ -504,6 +554,9 @@ class LocalSandbox(Sandbox):
         its own process group so a genuinely blocking foreground command can be
         killed in full (children included) when it times out.
 
+        ``env`` is forwarded to :class:`subprocess.Popen`; ``None`` means
+        inherit the current process environment (the common case).
+
         Returns ``(stdout, stderr, returncode, timed_out)``.
         """
         timed_out = False
@@ -517,6 +570,7 @@ class LocalSandbox(Sandbox):
                 stdout=stdout_write_fd,
                 stderr=stderr_write_fd,
                 start_new_session=True,
+                env=env,
             )
         except Exception:
             for fd in (stdout_read_fd, stdout_write_fd, stderr_read_fd, stderr_write_fd):
@@ -592,7 +646,37 @@ class LocalSandbox(Sandbox):
             is_dir = entry.endswith(("/", "\\"))
             reversed_entry = self._reverse_resolve_path(entry.rstrip("/\\")) if is_dir else self._reverse_resolve_path(entry)
             result.append(f"{reversed_entry}/" if is_dir and not reversed_entry.endswith("/") else reversed_entry)
-        return result
+
+        # Virtual sub-directory overlay: when a container path like /mnt/skills
+        # has child mappings (public, custom, legacy) whose local_path targets
+        # are outside the resolved host directory (symlinks or bind-mount style),
+        # the ``list_dir`` utility skips them for security. We patch those
+        # missing virtual children back in so the agent can discover them via
+        # ``ls /mnt/skills``.
+        container_path = path.rstrip("/")
+        existing_dirs = {e.rstrip("/") for e in result if e.endswith("/")}
+        for mapping in self.path_mappings:
+            # A mapping is a virtual child if:
+            # 1. Its container_path is a direct child of the requested path
+            # 2. It is NOT already present in the result (was skipped by list_dir)
+            if mapping.container_path.startswith(container_path + "/"):
+                child_rel = mapping.container_path[len(container_path) + 1 :]
+                # Only direct children (no further slashes), e.g. "public", "custom".
+                # Compare the mapping's full container path -- not the bare child
+                # name -- against existing_dirs, which holds full paths (e.g.
+                # "/mnt/user-data/workspace"). Comparing the bare name here would
+                # never match, so an already-listed mount (the common case: real
+                # nested workspace/uploads/outputs subdirectories under
+                # /mnt/user-data) would be appended a second time.
+                if "/" not in child_rel and mapping.container_path.rstrip("/") not in existing_dirs:
+                    # Verify the host path exists so we don't add phantom entries
+                    try:
+                        if Path(mapping.local_path).resolve().is_dir():
+                            result.append(f"{mapping.container_path}/")
+                    except OSError:
+                        pass
+
+        return sorted(result)
 
     def read_file(self, path: str) -> str:
         resolved_path = self._resolve_path(path)

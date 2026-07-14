@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.memory import InMemorySaver
 
+from deerflow.runtime.context_keys import CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY
 from deerflow.runtime.runs.manager import ConflictError, RunManager
 from deerflow.runtime.runs.schemas import RunStatus
 from deerflow.runtime.runs.worker import (
@@ -17,6 +18,7 @@ from deerflow.runtime.runs.worker import (
     _agent_factory_supports_app_config,
     _build_runtime_context,
     _bump_channel_version,
+    _collect_pre_existing_message_ids,
     _ensure_interrupted_title,
     _extract_llm_error_fallback_message,
     _install_runtime_context,
@@ -69,6 +71,21 @@ def test_install_runtime_context_preserves_existing_thread_id_and_threads_app_co
     assert config["context"]["app_config"] is app_config
 
 
+def test_install_runtime_context_overrides_internal_pre_existing_message_ids():
+    config = {"context": {CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY: {"spoofed"}}}
+
+    _install_runtime_context(
+        config,
+        {
+            "thread_id": "record-thread",
+            "run_id": "run-1",
+            CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY: frozenset({"old-ai"}),
+        },
+    )
+
+    assert config["context"][CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY] == frozenset({"old-ai"})
+
+
 @pytest.mark.anyio
 async def test_run_agent_threads_explicit_app_config_into_config_only_factory():
     run_manager = RunManager()
@@ -108,6 +125,81 @@ async def test_run_agent_threads_explicit_app_config_into_config_only_factory():
     assert fetched.status == RunStatus.success
     bridge.publish_end.assert_awaited_once_with(record.run_id)
     bridge.cleanup.assert_awaited_once_with(record.run_id, delay=60)
+
+
+@pytest.mark.anyio
+async def test_run_agent_threads_pre_existing_message_ids_into_runtime_context():
+    run_manager = RunManager()
+    record = await run_manager.create("thread-1")
+    bridge = SimpleNamespace(
+        publish=AsyncMock(),
+        publish_end=AsyncMock(),
+        cleanup=AsyncMock(),
+    )
+    captured: dict[str, object] = {}
+
+    class DummyCheckpointer:
+        async def aget_tuple(self, _config):
+            return SimpleNamespace(
+                config={"configurable": {"checkpoint_id": "checkpoint-1"}},
+                checkpoint={"channel_values": {"messages": [AIMessage(id="old-ai", content="old")]}},
+                metadata={},
+                pending_writes=[],
+            )
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            captured["context"] = config["context"]
+            yield {"messages": []}
+
+    def factory(*, config):
+        return DummyAgent()
+
+    await run_agent(
+        bridge,
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=DummyCheckpointer()),
+        agent_factory=factory,
+        graph_input={},
+        config={},
+    )
+
+    context = captured["context"]
+    assert context[CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY] == frozenset({"old-ai"})
+
+
+@pytest.mark.anyio
+async def test_run_agent_overrides_spoofed_pre_existing_message_ids_without_snapshot():
+    run_manager = RunManager()
+    record = await run_manager.create("thread-1")
+    bridge = SimpleNamespace(
+        publish=AsyncMock(),
+        publish_end=AsyncMock(),
+        cleanup=AsyncMock(),
+    )
+    captured: dict[str, object] = {}
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            captured["context"] = config["context"]
+            yield {"messages": []}
+
+    def factory(*, config):
+        return DummyAgent()
+
+    await run_agent(
+        bridge,
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=None),
+        agent_factory=factory,
+        graph_input={},
+        config={"context": {CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY: {"spoofed"}}},
+    )
+
+    context = captured["context"]
+    assert context[CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY] == frozenset()
 
 
 @pytest.mark.anyio
@@ -534,6 +626,14 @@ def test_build_runtime_context_caller_cannot_override_thread_id_or_run_id():
     assert ctx["agent_name"] == "ok"
 
 
+def test_build_runtime_context_ignores_caller_pre_existing_message_ids():
+    caller_context = {CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY: {"spoofed"}}
+
+    ctx = _build_runtime_context("thread-1", "run-1", caller_context)
+
+    assert CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY not in ctx
+
+
 def test_build_runtime_context_ignores_non_dict_caller_context():
     ctx = _build_runtime_context("thread-1", "run-1", "not-a-dict")
     assert ctx == {"thread_id": "thread-1", "run_id": "run-1"}
@@ -677,6 +777,208 @@ def test_extract_llm_error_fallback_message_updates_mode_no_fallback():
         ]
     }
     assert _extract_llm_error_fallback_message(update_chunk) is None
+
+
+# ---------------------------------------------------------------------------
+# pre_existing_ids filtering — stale fallback markers from prior runs
+# ---------------------------------------------------------------------------
+
+
+def test_try_extract_skips_message_with_pre_existing_id():
+    """Fallback marker on a message whose id is in pre_existing_ids must be ignored."""
+    msg = AIMessage(
+        id="stale-1",
+        content="Unavailable.",
+        additional_kwargs={
+            "deerflow_error_fallback": True,
+            "error_detail": "Connection error.",
+        },
+    )
+    assert _try_extract_from_message(msg, {"stale-1"}) is None
+    # Without the filter, the same message would still surface the marker.
+    assert _try_extract_from_message(msg) == "Connection error."
+
+
+def test_try_extract_still_finds_fresh_message_when_others_are_stale():
+    """A non-stale message with a fallback marker must still match."""
+    msg = AIMessage(
+        id="fresh-1",
+        content="Unavailable.",
+        additional_kwargs={
+            "deerflow_error_fallback": True,
+            "error_detail": "Connection error.",
+        },
+    )
+    assert _try_extract_from_message(msg, {"stale-1", "stale-2"}) == "Connection error."
+
+
+def test_try_extract_skips_dict_message_with_pre_existing_id():
+    msg = {
+        "id": "stale-2",
+        "content": "Unavailable.",
+        "additional_kwargs": {
+            "deerflow_error_fallback": True,
+            "error_detail": "Quota exceeded.",
+        },
+    }
+    assert _try_extract_from_message(msg, {"stale-2"}) is None
+    assert _try_extract_from_message(msg) == "Quota exceeded."
+
+
+def test_extract_llm_error_fallback_message_skips_stale_history():
+    """A state chunk replaying a stale fallback marker from a prior run must return None."""
+    state = {
+        "messages": [
+            AIMessage(id="stale-1", content="Hi"),
+            AIMessage(
+                id="stale-fallback",
+                content="Unavailable.",
+                additional_kwargs={
+                    "deerflow_error_fallback": True,
+                    "error_detail": "Connection error.",
+                },
+            ),
+        ]
+    }
+    assert _extract_llm_error_fallback_message(state, {"stale-1", "stale-fallback"}) is None
+
+
+def test_extract_llm_error_fallback_message_returns_fresh_marker_alongside_stale_history():
+    """Stale history is ignored, but a brand-new fallback in the same chunk is reported."""
+    state = {
+        "messages": [
+            AIMessage(id="stale-1", content="Hi"),
+            AIMessage(
+                id="stale-fallback",
+                content="Old failure.",
+                additional_kwargs={
+                    "deerflow_error_fallback": True,
+                    "error_detail": "Old error.",
+                },
+            ),
+            AIMessage(
+                id="fresh-fallback",
+                content="New failure.",
+                additional_kwargs={
+                    "deerflow_error_fallback": True,
+                    "error_detail": "Fresh error.",
+                },
+            ),
+        ]
+    }
+    assert _extract_llm_error_fallback_message(state, {"stale-1", "stale-fallback"}) == "Fresh error."
+
+
+def test_extract_llm_error_fallback_message_default_filter_is_empty():
+    """Passing no pre_existing_ids must preserve the original (pre-fix) behavior."""
+    state = {
+        "messages": [
+            AIMessage(
+                id="any",
+                content="Unavailable.",
+                additional_kwargs={
+                    "deerflow_error_fallback": True,
+                    "error_detail": "Connection error.",
+                },
+            )
+        ]
+    }
+    assert _extract_llm_error_fallback_message(state) == "Connection error."
+
+
+def test_collect_pre_existing_message_ids_pulls_ids_from_snapshot():
+    snapshot = {
+        "checkpoint": {
+            "channel_values": {
+                "messages": [
+                    AIMessage(id="a", content="x"),
+                    AIMessage(id="b", content="y"),
+                    AIMessage(content="no-id-here"),  # ignored
+                ]
+            }
+        }
+    }
+    assert _collect_pre_existing_message_ids(snapshot) == {"a", "b"}
+
+
+def test_collect_pre_existing_message_ids_handles_missing_pieces():
+    assert _collect_pre_existing_message_ids(None) == set()
+    assert _collect_pre_existing_message_ids({}) == set()
+    assert _collect_pre_existing_message_ids({"checkpoint": None}) == set()
+    assert _collect_pre_existing_message_ids({"checkpoint": {}}) == set()
+    assert _collect_pre_existing_message_ids({"checkpoint": {"channel_values": None}}) == set()
+    assert _collect_pre_existing_message_ids({"checkpoint": {"channel_values": {"messages": None}}}) == set()
+
+
+@pytest.mark.anyio
+async def test_run_agent_ignores_stale_llm_error_fallback_from_prior_run():
+    """A stale fallback marker checkpointed by an earlier run on the same thread
+    must NOT cause a successful current run to be reported as ``error``.
+
+    This guards against the regression where one IndexError-driven failure (now
+    classified transient and surfaced as a ``deerflow_error_fallback`` AIMessage)
+    persisted in thread history and tripped ``RunStatus.error`` on every
+    subsequent run that re-played the messages channel via ``stream_mode="values"``.
+    """
+    run_manager = RunManager()
+    record = await run_manager.create("thread-1")
+    bridge = SimpleNamespace(
+        publish=AsyncMock(),
+        publish_end=AsyncMock(),
+        cleanup=AsyncMock(),
+    )
+
+    stale_fallback = AIMessage(
+        id="stale-fallback",
+        content="Old failure.",
+        additional_kwargs={
+            "deerflow_error_fallback": True,
+            "error_type": "IndexError",
+            "error_reason": "transient",
+            "error_detail": "list index out of range",
+        },
+    )
+
+    class StaleHistoryCheckpointer:
+        async def aget_tuple(self, config):
+            checkpoint = empty_checkpoint()
+            checkpoint["id"] = "ckpt-stale"
+            checkpoint["channel_values"] = {"messages": [stale_fallback]}
+            return SimpleNamespace(
+                config={"configurable": {"thread_id": "thread-1", "checkpoint_ns": "", "checkpoint_id": "ckpt-stale"}},
+                checkpoint=checkpoint,
+                metadata={},
+                pending_writes=[],
+            )
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            # Replay the prior fallback message (as LangGraph would when using
+            # stream_mode="values") and then yield a fresh successful AIMessage.
+            yield {
+                "messages": [
+                    stale_fallback,
+                    AIMessage(id="fresh-ok", content="Hello — the run succeeded."),
+                ]
+            }
+
+    def factory(*, config):
+        return DummyAgent()
+
+    await run_agent(
+        bridge,
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=StaleHistoryCheckpointer()),
+        agent_factory=factory,
+        graph_input={},
+        config={},
+    )
+
+    fetched = await run_manager.get(record.run_id)
+    assert fetched is not None
+    assert fetched.status == RunStatus.success, f"Stale fallback marker from prior run should not flip current run to error, got status={fetched.status} error={fetched.error!r}"
+    bridge.publish_end.assert_awaited_once_with(record.run_id)
 
 
 class _FakeCheckpointTuple:

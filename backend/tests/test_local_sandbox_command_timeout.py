@@ -77,7 +77,7 @@ def test_foreground_blocking_command_times_out_with_notice():
 
 def test_timeout_notice_formats_fractional_and_singular_timeouts(monkeypatch):
     monkeypatch.setattr(LocalSandbox, "_get_shell", lambda self: "/bin/sh")
-    monkeypatch.setattr(LocalSandbox, "_run_posix_command", staticmethod(lambda args, timeout: ("", "", 0, True)))
+    monkeypatch.setattr(LocalSandbox, "_run_posix_command", staticmethod(lambda args, timeout, env=None: ("", "", 0, True)))
 
     assert "after 1.5 seconds" in LocalSandbox("t").execute_command("wait", timeout=1.5)
     assert "after 1 second" in LocalSandbox("t").execute_command("wait", timeout=1)
@@ -145,6 +145,11 @@ def test_normal_command_output_exit_code_and_stderr():
 def test_sandbox_config_exposes_command_timeout_default():
     cfg = SandboxConfig(use="deerflow.sandbox.local:LocalSandboxProvider")
     assert cfg.bash_command_timeout == 600
+
+
+def test_sandbox_config_exposes_health_check_skip_seconds_default():
+    cfg = SandboxConfig(use="deerflow.sandbox.local:LocalSandboxProvider")
+    assert cfg.health_check_skip_seconds is None
 
 
 def test_bash_tool_description_guides_backgrounding_long_lived_processes():

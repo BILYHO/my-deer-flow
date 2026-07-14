@@ -322,6 +322,73 @@ class TestLoadAgentSoul:
 
         assert soul is None
 
+    def test_loads_soul_without_config_yaml(self, tmp_path):
+        """SOUL.md should load even when the agent dir has no config.yaml (#4135)."""
+        agent_dir = tmp_path / "agents" / "soul-only"
+        agent_dir.mkdir(parents=True)
+        # Deliberately no config.yaml – the agent is configured externally
+        (agent_dir / "SOUL.md").write_text("You are a brave agent.", encoding="utf-8")
+
+        with patch("deerflow.config.agents_config.get_paths", return_value=_make_paths(tmp_path)), patch("deerflow.config.agents_config.get_effective_user_id", return_value="default"):
+            from deerflow.config.agents_config import load_agent_soul
+
+            soul = load_agent_soul("soul-only")
+
+        assert soul == "You are a brave agent."
+
+    def test_loads_soul_from_user_dir_without_config_yaml(self, tmp_path):
+        """Fallback should find SOUL.md when resolver returns a default dir without it (#4135).
+
+        Setup: per-user agent 'foo' exists as a memory-only directory
+        (no config.yaml, no SOUL.md). Legacy agent 'foo' has SOUL.md but
+        no config.yaml. resolve_agent_dir returns the per-user path as
+        default (neither dir has config.yaml). The fallback then finds
+        SOUL.md in the legacy directory.
+        """
+        # Per-user dir: memory-only (no config.yaml, no SOUL.md)
+        user_dir = tmp_path / "users" / "test-user" / "agents" / "foo"
+        user_dir.mkdir(parents=True)
+        (user_dir / "memory.json").write_text("{}", encoding="utf-8")
+
+        # Legacy dir: has SOUL.md but no config.yaml
+        legacy_dir = tmp_path / "agents" / "foo"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "SOUL.md").write_text("You are a legacy agent.", encoding="utf-8")
+
+        with patch("deerflow.config.agents_config.get_paths", return_value=_make_paths(tmp_path)), patch("deerflow.config.agents_config.get_effective_user_id", return_value="test-user"):
+            from deerflow.config.agents_config import load_agent_soul
+
+            soul = load_agent_soul("foo")
+
+        assert soul == "You are a legacy agent."
+
+    def test_soul_not_leaked_from_legacy_when_per_user_has_config(self, tmp_path):
+        """Per-user agent with config.yaml but no SOUL.md should NOT fall back to legacy SOUL.md.
+
+        This verifies the gated condition: fallback only fires when the
+        resolved dir lacks config.yaml. A properly-resolved per-user agent
+        that simply has no SOUL.md returns None, preserving the
+        "per-user entries fully shadow legacy entries" invariant.
+        """
+        # Legacy dir: has SOUL.md
+        legacy_dir = tmp_path / "agents" / "foo"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "config.yaml").write_text("name: foo\n")
+        (legacy_dir / "SOUL.md").write_text("You are a legacy agent.", encoding="utf-8")
+
+        # Per-user dir: has config.yaml (resolver returns this) but no SOUL.md
+        user_dir = tmp_path / "users" / "test-user" / "agents" / "foo"
+        user_dir.mkdir(parents=True)
+        (user_dir / "config.yaml").write_text("name: foo\n")
+        # No SOUL.md in per-user dir
+
+        with patch("deerflow.config.agents_config.get_paths", return_value=_make_paths(tmp_path)), patch("deerflow.config.agents_config.get_effective_user_id", return_value="test-user"):
+            from deerflow.config.agents_config import load_agent_soul
+
+            soul = load_agent_soul("foo")
+
+        assert soul is None
+
 
 # ===========================================================================
 # 5. list_custom_agents
@@ -574,6 +641,59 @@ class TestAgentsAPI:
         response = agent_client.put("/api/agents/desc-agent", json={"description": "new desc"})
         assert response.status_code == 200
         assert response.json()["description"] == "new desc"
+
+    def test_update_agent_preserves_hand_authored_github_block(self, agent_client):
+        """A hand-authored ``github:`` block on disk must survive PATCH.
+
+        The HTTP route does not expose ``github`` as an editable field
+        (and rightly so — the GitHub App credentials and binding triggers
+        are operator-authored, not end-user-editable). But it MUST carry
+        the block forward when rewriting ``config.yaml`` for a description /
+        model / tool_groups / skills change, otherwise an operator who
+        edits the agent's description from the Web UI silently strips the
+        binding and the next webhook delivery silently no-ops.
+
+        Mirrors the same property the harness ``update_agent`` tool enforces
+        via ``preserve_non_managed_fields``; both surfaces share the helper.
+        """
+        # Create an agent through the API, then hand-author a github: block
+        # into its config.yaml — exactly the workflow an operator would
+        # follow when wiring a new repo binding.
+        agent_client.post("/api/agents", json={"name": "github-agent", "description": "old desc", "soul": "p"})
+
+        tmp_path: Path = agent_client._tmp_path  # type: ignore[attr-defined]
+        agent_dir = tmp_path / "users" / "test-user-autouse" / "agents" / "github-agent"
+        config_file = agent_dir / "config.yaml"
+        config_data = yaml.safe_load(config_file.read_text())
+        config_data["github"] = {
+            "installation_id": 99999,
+            "bot_login": "github-agent-bot",
+            "bindings": [
+                {
+                    "repo": "acme/widget",
+                    "triggers": {"pull_request": {"actions": ["opened"]}},
+                }
+            ],
+        }
+        config_file.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+
+        # PATCH only the description.
+        response = agent_client.put("/api/agents/github-agent", json={"description": "new desc"})
+        assert response.status_code == 200
+
+        # github: block must survive verbatim.
+        reloaded = yaml.safe_load(config_file.read_text())
+        assert reloaded["description"] == "new desc"
+        assert reloaded["github"] == {
+            "installation_id": 99999,
+            "bot_login": "github-agent-bot",
+            "bindings": [
+                {
+                    "repo": "acme/widget",
+                    "triggers": {"pull_request": {"actions": ["opened"]}},
+                }
+            ],
+        }
 
     def test_update_missing_agent_404(self, agent_client):
         response = agent_client.put("/api/agents/ghost-agent", json={"soul": "new"})

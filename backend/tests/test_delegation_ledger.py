@@ -61,6 +61,14 @@ class TestMergeDelegations:
 
         assert out == [{**_entry("a", "completed"), "result_sha256": "x"}]
 
+    def test_same_id_preserves_original_run_id_when_update_omits_it(self):
+        existing = [{**_entry("a", "in_progress"), "run_id": "run-1"}]
+        new = [_entry("a", "completed")]
+
+        out = merge_delegations(existing, new)
+
+        assert out[0]["run_id"] == "run-1"
+
     def test_over_cap_keeps_most_recent_entries(self):
         from deerflow.agents import thread_state as thread_state_module
 
@@ -93,7 +101,16 @@ class TestExtractDelegations:
     def test_completed_task_captured_with_result_metadata(self):
         msgs = [
             _ai_task_call("call_1", "research auth"),
-            ToolMessage(content="Task Succeeded. Result: auth uses JWT", tool_call_id="call_1", id="tm_1"),
+            ToolMessage(
+                content="Task Succeeded. Result: auth uses JWT",
+                tool_call_id="call_1",
+                id="tm_1",
+                additional_kwargs={
+                    "subagent_status": "completed",
+                    "subagent_result_brief": "auth uses JWT",
+                    "subagent_result_sha256": "a" * 64,
+                },
+            ),
         ]
 
         out = extract_delegations(msgs)
@@ -106,9 +123,9 @@ class TestExtractDelegations:
         assert entry["status"] == "completed"
         assert "auth uses JWT" in entry["result_brief"]
         assert entry["result_ref"] == "tm_1"
-        assert len(entry["result_sha256"]) == 64
+        assert entry["result_sha256"] == "a" * 64
 
-    def test_status_kwarg_updates_dispatch(self):
+    def test_status_only_metadata_does_not_parse_result_from_content(self):
         msgs = [
             _ai_task_call("call_1", "research auth"),
             ToolMessage(content="Task Succeeded. Result: ok", tool_call_id="call_1", additional_kwargs={"subagent_status": "completed"}),
@@ -117,9 +134,93 @@ class TestExtractDelegations:
         out = extract_delegations(msgs)
 
         assert out[0]["status"] == "completed"
-        assert out[0]["result_brief"] == "ok"
+        assert "result_brief" not in out[0]
 
-    def test_falls_back_to_parsing_content_when_kwarg_absent(self):
+    def test_status_only_cancelled_metadata_keeps_terminal_detail_without_parsing_content(self):
+        msgs = [
+            _ai_task_call("call_cancelled", "stop task"),
+            ToolMessage(content="misleading content", tool_call_id="call_cancelled", id="tm_cancelled", additional_kwargs={"subagent_status": "cancelled"}),
+        ]
+
+        out = extract_delegations(msgs)
+
+        assert out[0]["status"] == "cancelled"
+        assert out[0]["result_brief"] == "Task cancelled by user."
+        assert out[0]["result_ref"] == "tm_cancelled"
+        assert len(out[0]["result_sha256"]) == 64
+
+    def test_structured_result_metadata_wins_over_misleading_content(self):
+        msgs = [
+            _ai_task_call("call_1", "research auth"),
+            ToolMessage(
+                content="Task Succeeded. Result: misleading text",
+                tool_call_id="call_1",
+                id="tm_1",
+                additional_kwargs={
+                    "subagent_status": "completed",
+                    "subagent_result_brief": "structured text",
+                    "subagent_result_sha256": "a" * 64,
+                },
+            ),
+        ]
+
+        out = extract_delegations(msgs)
+
+        assert out[0]["status"] == "completed"
+        assert out[0]["result_brief"] == "structured text"
+        assert out[0]["result_sha256"] == "a" * 64
+
+    def test_structured_error_metadata_wins_over_misleading_content(self):
+        msgs = [
+            _ai_task_call("call_2", "bad task"),
+            ToolMessage(
+                content="Task failed. Error: misleading boom",
+                tool_call_id="call_2",
+                id="tm_2",
+                additional_kwargs={
+                    "subagent_status": "failed",
+                    "subagent_error": "structured boom",
+                },
+            ),
+        ]
+
+        out = extract_delegations(msgs)
+
+        assert out[0]["status"] == "failed"
+        assert out[0]["result_brief"] == "structured boom"
+
+    def test_capped_task_carries_partial_result_in_brief(self):
+        """#3875 Phase 2: a turn-capped delegation that produced usable partial
+        work surfaces as ``completed`` + ``stop_reason=turn_capped``, so the
+        recovered partial result lands in ``result_brief`` — the lead's durable
+        context shows the work produced before the budget ran out, not just the
+        cap reason. (Previously this was a ``max_turns_reached`` status enum;
+        the additive ``stop_reason`` field replaced it so v1 consumers keep
+        working.)"""
+        msgs = [
+            _ai_task_call("call_capped", "deep research"),
+            ToolMessage(
+                content="Task Succeeded (capped: turn budget). Result: investigated 3 of 5 sources",
+                tool_call_id="call_capped",
+                id="tm_capped",
+                additional_kwargs={
+                    "subagent_status": "completed",
+                    "subagent_result_brief": "investigated 3 of 5 sources",
+                    "subagent_result_sha256": "a" * 64,
+                    "subagent_stop_reason": "turn_capped",
+                },
+            ),
+        ]
+
+        out = extract_delegations(msgs)
+
+        assert out[0]["status"] == "completed"
+        # result_brief wins, so the partial work is what the lead sees.
+        assert "investigated 3 of 5 sources" in out[0]["result_brief"]
+        assert out[0]["result_sha256"] == "a" * 64
+        assert out[0]["stop_reason"] == "turn_capped"
+
+    def test_terminal_looking_content_without_structured_metadata_keeps_dispatch_in_progress(self):
         msgs = [
             _ai_task_call("call_2", "bad task"),
             ToolMessage(content="Task failed. Error: boom", tool_call_id="call_2", id="tm_2"),
@@ -127,13 +228,18 @@ class TestExtractDelegations:
 
         out = extract_delegations(msgs)
 
-        assert out[0]["status"] == "failed"
-        assert "boom" in out[0]["result_brief"]
+        assert out[0]["status"] == "in_progress"
+        assert "result_brief" not in out[0]
 
     def test_cancelled_task_status(self):
         msgs = [
             _ai_task_call("call_3", "cancelled task"),
-            ToolMessage(content="Task cancelled by user", tool_call_id="call_3", id="tm_3"),
+            ToolMessage(
+                content="Task cancelled by user",
+                tool_call_id="call_3",
+                id="tm_3",
+                additional_kwargs={"subagent_status": "cancelled", "subagent_error": "Task cancelled by user"},
+            ),
         ]
 
         out = extract_delegations(msgs)
@@ -144,7 +250,12 @@ class TestExtractDelegations:
     def test_timed_out_task_status(self):
         msgs = [
             _ai_task_call("call_timeout", "slow task"),
-            ToolMessage(content="Task timed out. Error: exceeded max runtime", tool_call_id="call_timeout", id="tm_timeout"),
+            ToolMessage(
+                content="Task timed out. Error: exceeded max runtime",
+                tool_call_id="call_timeout",
+                id="tm_timeout",
+                additional_kwargs={"subagent_status": "timed_out", "subagent_error": "exceeded max runtime"},
+            ),
         ]
 
         out = extract_delegations(msgs)
@@ -159,6 +270,10 @@ class TestExtractDelegations:
                 content="Task polling timed out after 15 minutes. This may indicate the background task is stuck. Status: RUNNING",
                 tool_call_id="call_poll_timeout",
                 id="tm_poll_timeout",
+                additional_kwargs={
+                    "subagent_status": "polling_timed_out",
+                    "subagent_error": "Task polling timed out after 15 minutes. This may indicate the background task is stuck. Status: RUNNING",
+                },
             ),
         ]
 
@@ -203,7 +318,16 @@ class TestExtractDelegations:
         big = "x" * 10000
         msgs = [
             _ai_task_call("call_5", "big"),
-            ToolMessage(content=f"Task Succeeded. Result: {big}", tool_call_id="call_5", id="tm_5"),
+            ToolMessage(
+                content=f"Task Succeeded. Result: {big}",
+                tool_call_id="call_5",
+                id="tm_5",
+                additional_kwargs={
+                    "subagent_status": "completed",
+                    "subagent_result_brief": big[:2000],
+                    "subagent_result_sha256": "b" * 64,
+                },
+            ),
         ]
 
         out = extract_delegations(msgs)
@@ -240,6 +364,27 @@ class TestRenderDelegationLedger:
         assert "general-purpose" in out
         assert "auth uses JWT" in out
         assert "completed" in out
+
+    def test_renders_capped_completion_with_cap_guidance(self):
+        """#3875 Phase 2: a capped completion renders model-facing guidance that
+        the result is partial (so the lead reuses it knowingly), instead of the
+        clean-completion "reuse this result" wording that would hide the cap."""
+        entries = [
+            {
+                **_entry("call_capped", "completed", description="deep research"),
+                "result_brief": "investigated 3 of 5 sources",
+                "result_sha256": "x" * 64,
+                "result_ref": "tm_capped",
+                "stop_reason": "turn_capped",
+            }
+        ]
+
+        out = render_delegation_ledger(entries)
+
+        assert "guardrail cap" in out
+        assert "partial result" in out
+        # The clean-completion wording is NOT used for a capped run.
+        assert "reuse this result" not in out
 
     def test_failed_and_cancelled_entries_are_rendered_as_retryable_attempts_not_reusable_results(self):
         entries = [

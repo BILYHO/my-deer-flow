@@ -10,15 +10,20 @@ from typing import Any
 from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 
 from deerflow.agents.thread_state import DelegationEntry
-from deerflow.subagents.status_contract import SUBAGENT_STATUS_KEY, extract_subagent_status
+from deerflow.subagents.status_contract import (
+    read_subagent_result_metadata,
+)
 
 _RESULT_BRIEF_CAP = 2000
 _DESCRIPTION_CAP = 200
 _LEDGER_RENDER_CHAR_BUDGET = 6000
 _LEDGER_ENTRY_RESULT_RENDER_CAP = 120
-_TASK_SUCCESS_PREFIX = "Task Succeeded. Result:"
-_TASK_FAILED_PREFIX = "Task failed. Error:"
-_TASK_TIMED_OUT_PREFIX = "Task timed out. Error:"
+_STATUS_ONLY_RESULT_BRIEFS = {
+    "failed": "Task failed.",
+    "cancelled": "Task cancelled by user.",
+    "timed_out": "Task timed out.",
+    "polling_timed_out": "Task polling timed out.",
+}
 
 
 def _utc_now_iso() -> str:
@@ -41,25 +46,20 @@ def _bound_text(text: str, cap: int = _RESULT_BRIEF_CAP) -> str:
     return f"{text[:head]}{omitted_marker}{text[-tail:]}"
 
 
-def _parse_task_result(content: str, status: str | None = None) -> tuple[str, str] | None:
-    text = (content if isinstance(content, str) else str(content)).strip()
-    status = status or extract_subagent_status(text)
-    if status is None:
-        return None
-    if status == "completed" and text.startswith(_TASK_SUCCESS_PREFIX):
-        return status, text[len(_TASK_SUCCESS_PREFIX) :].strip()
-    if status == "failed" and text.startswith(_TASK_FAILED_PREFIX):
-        return status, text[len(_TASK_FAILED_PREFIX) :].strip()
-    if status == "timed_out" and text.startswith(_TASK_TIMED_OUT_PREFIX):
-        return status, text[len(_TASK_TIMED_OUT_PREFIX) :].strip()
-    return status, text
-
-
 def _escape_context_text(value: object) -> str:
     return escape(" ".join(str(value).split()), quote=False)
 
 
-def _status_guidance(status: str) -> str:
+def _status_guidance(status: str, stop_reason: str | None = None) -> str:
+    if stop_reason:
+        # A guardrail cap ended this run early (#3875 Phase 2): the status is
+        # still completed/failed, and ``stop_reason`` carries *why* it stopped
+        # (token_capped / turn_capped / loop_capped). The old contract surfaced
+        # this as a separate ``max_turns_reached`` status; the additive
+        # ``stop_reason`` field replaced it so v1 consumers keep working.
+        if status == "completed":
+            return "hit a guardrail cap with a partial result; reuse the partial result, retry with a tighter scope, or raise the per-agent budget (max_turns / token_budget)"
+        return "hit a guardrail cap with no usable result; retry with a tighter scope or raise the per-agent budget (max_turns / token_budget)"
     if status == "in_progress":
         return "already delegated; do NOT delegate again; wait for or build on the result"
     if status == "completed":
@@ -128,21 +128,23 @@ def extract_delegations(messages: list[AnyMessage]) -> list[DelegationEntry]:
         entry = entries_by_id.get(tool_call_id)
         if entry is None:
             continue
-        content = message.content if isinstance(message.content, str) else str(message.content)
-        status = message.additional_kwargs.get(SUBAGENT_STATUS_KEY)
-        parsed = _parse_task_result(content, status if isinstance(status, str) else None)
-        if parsed is None:
+        structured = read_subagent_result_metadata(message.additional_kwargs)
+        if structured is None:
             continue
-        status, result_text = parsed
-        result_ref = str(message.id or tool_call_id)
-        entry.update(
-            {
-                "status": status,
-                "result_brief": _bound_text(result_text),
-                "result_sha256": hashlib.sha256(result_text.encode("utf-8")).hexdigest(),
-                "result_ref": result_ref,
-            }
-        )
+        entry["status"] = structured["status"]
+        stop_reason = structured.get("stop_reason")
+        if stop_reason:
+            entry["stop_reason"] = stop_reason
+        result_text = structured.get("result_brief") or structured.get("error") or _STATUS_ONLY_RESULT_BRIEFS.get(structured["status"])
+        if result_text:
+            result_sha256 = structured.get("result_sha256") or hashlib.sha256(result_text.encode("utf-8")).hexdigest()
+            entry.update(
+                {
+                    "result_brief": _bound_text(result_text),
+                    "result_sha256": result_sha256,
+                    "result_ref": str(message.id or tool_call_id),
+                }
+            )
     return [entries_by_id[tool_call_id] for tool_call_id in order]
 
 
@@ -154,7 +156,7 @@ def _render_entry_line(entry: DelegationEntry) -> str:
     status = _escape_context_text(entry["status"])
     description = _escape_context_text(entry["description"])
     subagent_type = _escape_context_text(entry["subagent_type"])
-    guidance = _status_guidance(entry["status"])
+    guidance = _status_guidance(entry["status"], entry.get("stop_reason"))
     line = f"- [{status}] {description} (via {subagent_type}; {guidance})"
     result_brief = entry.get("result_brief")
     if result_brief:

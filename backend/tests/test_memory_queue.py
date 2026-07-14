@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, call, patch
 
 from deerflow.agents.memory.queue import ConversationContext, MemoryUpdateQueue
 from deerflow.config.memory_config import MemoryConfig
+from deerflow.trace_context import get_current_trace_id, request_trace_context
 
 
 def _memory_config(**overrides: object) -> MemoryConfig:
@@ -51,6 +52,7 @@ def test_process_queue_forwards_correction_flag_to_updater() -> None:
         correction_detected=True,
         reinforcement_detected=False,
         user_id=None,
+        deerflow_trace_id=None,
     )
 
 
@@ -92,6 +94,7 @@ def test_process_queue_forwards_reinforcement_flag_to_updater() -> None:
         correction_detected=False,
         reinforcement_detected=True,
         user_id=None,
+        deerflow_trace_id=None,
     )
 
 
@@ -131,17 +134,70 @@ def test_add_nowait_cancels_existing_timer_and_starts_immediate_timer() -> None:
     created_timer.start.assert_called_once_with()
 
 
-def test_process_queue_reschedules_immediately_when_already_processing() -> None:
+def test_process_queue_defers_reprocess_when_already_processing() -> None:
+    """When a timer fires while a worker is active, ``_process_queue`` must set the
+    deferred-rerun flag instead of spinning up a tight 0-delay Timer chain.
+
+    The old behavior re-scheduled a 0-delay Timer on every re-entry while busy,
+    burning a fresh thread each time. The fix defers a single re-run via
+    ``_reprocess_pending`` that the finishing worker honors once.
+    """
     queue = MemoryUpdateQueue()
     queue._processing = True
-    created_timer = MagicMock()
 
-    with patch("deerflow.agents.memory.queue.threading.Timer", return_value=created_timer) as timer_cls:
+    with patch("deerflow.agents.memory.queue.threading.Timer") as timer_cls:
+        queue._process_queue()
+
+    timer_cls.assert_not_called()
+    assert queue._reprocess_pending is True
+
+
+def test_finishing_worker_reschedules_once_when_reprocess_pending() -> None:
+    """A worker that finishes with ``_reprocess_pending`` set and work still queued
+    schedules exactly one follow-up run (not a per-arrival timer spin)."""
+    queue = MemoryUpdateQueue()
+    queue._queue = [ConversationContext(thread_id="thread-1", messages=["first"], agent_name="lead_agent")]
+    queue._reprocess_pending = True
+    created_timer = MagicMock()
+    mock_updater = MagicMock()
+
+    def _enqueue_more_while_processing(**_kwargs) -> bool:
+        # Simulate a new update arriving mid-processing so the finally block sees
+        # remaining work and reschedules exactly once.
+        queue._queue.append(ConversationContext(thread_id="thread-2", messages=["second"], agent_name="lead_agent"))
+        return True
+
+    mock_updater.update_memory.side_effect = _enqueue_more_while_processing
+
+    with (
+        patch("deerflow.agents.memory.updater.MemoryUpdater", return_value=mock_updater),
+        patch("deerflow.agents.memory.queue.threading.Timer", return_value=created_timer) as timer_cls,
+    ):
         queue._process_queue()
 
     timer_cls.assert_called_once_with(0, queue._process_queue)
     assert created_timer.daemon is True
     created_timer.start.assert_called_once_with()
+    assert queue._reprocess_pending is False
+
+
+def test_finishing_worker_does_not_reschedule_when_no_work_remains() -> None:
+    """The deferred re-run is cleared even when nothing is left to process, so a
+    stray flag never leaves a dangling ``_reprocess_pending``."""
+    queue = MemoryUpdateQueue()
+    queue._queue = [ConversationContext(thread_id="thread-1", messages=["only"], agent_name="lead_agent")]
+    queue._reprocess_pending = True
+    mock_updater = MagicMock()
+    mock_updater.update_memory.return_value = True
+
+    with (
+        patch("deerflow.agents.memory.updater.MemoryUpdater", return_value=mock_updater),
+        patch("deerflow.agents.memory.queue.threading.Timer") as timer_cls,
+    ):
+        queue._process_queue()
+
+    timer_cls.assert_not_called()
+    assert queue._reprocess_pending is False
 
 
 def test_flush_nowait_is_non_blocking() -> None:
@@ -235,6 +291,7 @@ def test_process_queue_updates_different_agents_in_same_thread_separately() -> N
                 correction_detected=False,
                 reinforcement_detected=False,
                 user_id=None,
+                deerflow_trace_id=None,
             ),
             call(
                 messages=["agent-b"],
@@ -243,6 +300,158 @@ def test_process_queue_updates_different_agents_in_same_thread_separately() -> N
                 correction_detected=False,
                 reinforcement_detected=False,
                 user_id=None,
+                deerflow_trace_id=None,
             ),
         ]
     )
+
+
+def test_process_queue_forwards_deerflow_trace_id_to_updater() -> None:
+    queue = MemoryUpdateQueue()
+    queue._queue = [
+        ConversationContext(
+            thread_id="thread-1",
+            messages=["conversation"],
+            agent_name="lead_agent",
+            deerflow_trace_id="trace-memory-1",
+        )
+    ]
+    mock_updater = MagicMock()
+    mock_updater.update_memory.return_value = True
+
+    with patch("deerflow.agents.memory.updater.MemoryUpdater", return_value=mock_updater):
+        queue._process_queue()
+
+    mock_updater.update_memory.assert_called_once_with(
+        messages=["conversation"],
+        thread_id="thread-1",
+        agent_name="lead_agent",
+        correction_detected=False,
+        reinforcement_detected=False,
+        user_id=None,
+        deerflow_trace_id="trace-memory-1",
+    )
+
+
+class TestProcessQueueBindsTraceContextVar:
+    """Regression: ``_process_queue`` runs in a Timer thread where the request
+    trace ContextVar is unbound. The per-context iteration must bind
+    ``ConversationContext.deerflow_trace_id`` into the ContextVar so
+    ``TraceContextFilter`` (which only reads the ContextVar) attaches the correct
+    ``trace_id`` to log records emitted from ``queue.py`` itself (``"Updating
+    memory for thread ..."``, ``"Memory updated successfully..."``, exception
+    logs) — not just from the deep memory-updater stack.
+    """
+
+    @staticmethod
+    def _run_process_queue_in_fresh_thread(queue: MemoryUpdateQueue, mock_updater: MagicMock) -> None:
+        def _target() -> None:
+            with patch("deerflow.agents.memory.updater.MemoryUpdater", return_value=mock_updater):
+                queue._process_queue()
+
+        thread = threading.Thread(target=_target)
+        thread.start()
+        thread.join()
+
+    def test_process_queue_binds_deerflow_trace_id_during_iteration(self) -> None:
+        queue = MemoryUpdateQueue()
+        queue._queue = [
+            ConversationContext(
+                thread_id="thread-1",
+                messages=["conversation"],
+                agent_name="lead_agent",
+                deerflow_trace_id="trace-queue-abc",
+            )
+        ]
+        captured: list[str | None] = []
+        mock_updater = MagicMock()
+
+        def _capture(**_kwargs) -> bool:
+            captured.append(get_current_trace_id())
+            return True
+
+        mock_updater.update_memory.side_effect = _capture
+
+        self._run_process_queue_in_fresh_thread(queue, mock_updater)
+
+        assert captured == ["trace-queue-abc"]
+
+    def test_process_queue_binds_distinct_ids_per_context(self) -> None:
+        """Each queued context must be scoped independently — a per-iteration bind,
+        not a batch-level one — so id A's logs don't bleed into id B's iteration."""
+        queue = MemoryUpdateQueue()
+        queue._queue = [
+            ConversationContext(
+                thread_id="thread-1",
+                messages=["conv-a"],
+                agent_name="agent-a",
+                deerflow_trace_id="trace-a",
+            ),
+            ConversationContext(
+                thread_id="thread-2",
+                messages=["conv-b"],
+                agent_name="agent-b",
+                deerflow_trace_id="trace-b",
+            ),
+        ]
+        captured: list[str | None] = []
+        mock_updater = MagicMock()
+
+        def _capture(**_kwargs) -> bool:
+            captured.append(get_current_trace_id())
+            return True
+
+        mock_updater.update_memory.side_effect = _capture
+
+        with (
+            patch("deerflow.agents.memory.updater.MemoryUpdater", return_value=mock_updater),
+            patch("deerflow.agents.memory.queue.time.sleep"),
+        ):
+            queue._process_queue()
+
+        assert captured == ["trace-a", "trace-b"]
+
+    def test_process_queue_leaves_contextvar_unbound_when_no_trace_id(self) -> None:
+        """A queued context without ``deerflow_trace_id`` must not fabricate one;
+        the ContextVar stays unbound and log records fall through to '-'."""
+        queue = MemoryUpdateQueue()
+        queue._queue = [
+            ConversationContext(
+                thread_id="thread-1",
+                messages=["conversation"],
+                agent_name="lead_agent",
+                deerflow_trace_id=None,
+            )
+        ]
+        captured: list[str | None] = []
+        mock_updater = MagicMock()
+
+        def _capture(**_kwargs) -> bool:
+            captured.append(get_current_trace_id())
+            return True
+
+        mock_updater.update_memory.side_effect = _capture
+
+        self._run_process_queue_in_fresh_thread(queue, mock_updater)
+
+        assert captured == [None]
+
+    def test_process_queue_restores_outer_contextvar_after_return(self) -> None:
+        queue = MemoryUpdateQueue()
+        queue._queue = [
+            ConversationContext(
+                thread_id="thread-1",
+                messages=["conversation"],
+                agent_name="lead_agent",
+                deerflow_trace_id="trace-inner",
+            )
+        ]
+        mock_updater = MagicMock()
+        mock_updater.update_memory.return_value = True
+
+        with (
+            request_trace_context("trace-outer"),
+            patch("deerflow.agents.memory.updater.MemoryUpdater", return_value=mock_updater),
+        ):
+            queue._process_queue()
+            assert get_current_trace_id() == "trace-outer"
